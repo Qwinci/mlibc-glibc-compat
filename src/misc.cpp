@@ -8,15 +8,17 @@
 #include <sys/epoll.h>
 #include <sched.h>
 #include <locale.h>
-#include <iconv.h>
 #include <dlfcn.h>
 #include <math.h>
+#include <limits.h>
+#include <wchar.h>
 #include <sys/sysinfo.h>
+#include <iconv.h>
 #include "utils.hpp"
+#include "config.h"
+#include "sysdeps.hpp"
 
-#if __has_include(<hel.h>)
-#define MANAGARM 1
-#endif
+static constexpr bool logSyscalls = true;
 
 struct mallinfo2 {
 	size_t arena;
@@ -40,7 +42,7 @@ EXPORT int malloc_trim(size_t pad) {
 }
 
 EXPORT void *__rawmemchr(const void *s, int c) {
-	return const_cast<void *>(memchr(s, c, SIZE_MAX));
+	return const_cast<void *>(memchr(s, c, SSIZE_MAX));
 }
 
 EXPORT_ALIAS("__rawmemchr") void *rawmemchr(const void *s, int c);
@@ -65,29 +67,52 @@ EXPORT int __libc_start_main(int (*fn)(int, char **argv, char **envp), int, char
 }
 
 asm(R"(
+.pushsection .text
 .globl _setjmp
 _setjmp:
 jmp setjmp
 .globl _longjmp
 _longjmp:
 jmp _longjmp
+.popsection
 )");
 
-#if MANAGARM
-#define WRAP_SYSCALL 1
-#else
-#define WRAP_SYSCALL 0
-#endif
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
 
 #if WRAP_SYSCALL
 EXPORT long syscall(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
-	fprintf(stderr, "syscall %ld\n", num);
-	__ensure(!"syscall is not implemented");
-}
-#endif
+	if constexpr(logSyscalls) {
+		fprintf(stderr, "mlibc_glibc_compat: wrapped syscall %ld\n", num);
+	}
 
-#if !WRAP_SYSCALL
+	switch(num) {
+	case 186:
+		return gettid();
+	case 202:
+		if(a1 & FUTEX_WAKE) {
+			if(auto err = mlibc_glibc_compat::sys_futex_wake((int *)a0)) {
+				errno = err;
+				return -1;
+			}
+			return 0;
+		}
+		else {
+			if(auto err = mlibc_glibc_compat::sys_futex_wait((int *)a0, (int)a2, (const struct timespec *)a3)) {
+				errno = err;
+				return -1;
+			}
+			return 0;
+		}
+	default:
+		fprintf(stderr, "mlibc_glibc_compat: syscall %ld is not implemented and returns ENOSYS\n", num);
+		errno = ENOSYS;
+		return -1;
+	}
+}
+#else
 asm(R"(
+.pushsection .text
 .globl syscall
 .type syscall, @function
 syscall:
@@ -108,6 +133,7 @@ neg %eax
 mov %eax, %fs:0(%rdi)
 mov $-1, %eax
 ret
+.popsection
 )");
 #endif
 
@@ -136,11 +162,6 @@ EXPORT int close_range(unsigned int first, unsigned int last, unsigned int flags
 		close(i);
 	}
 	return 0;
-}
-
-EXPORT int statx(int fd, const char *__restrict path, int flags, unsigned int mask, struct statx *__restrict buf) {
-	errno = ENOSYS;
-	return -1;
 }
 
 EXPORT int epoll_pwait2(int fd, epoll_event *events, int n, const timespec *timeout,
@@ -222,25 +243,23 @@ EXPORT int random_r(random_data *buf, int32_t *result) {
 	return 1;
 }
 
-EXPORT void arc4random_buf(void *buf, size_t n) {
+// todo properly implement in mlibc
+EXPORT void arc4random_buf(void *buf, size_t n) {}
 
-}
-
+// todo properly implement in mlibc
 EXPORT uint32_t arc4random() {
-	__ensure(false);
 	return 0;
 }
 
 // todo implement these
 EXPORT int strfromf128(char *__restrict s, size_t n, const char *__restrict format, __float128 fp) {
-	__ensure(false);
-	return ENOSYS;
+	return -1;
 }
 
 EXPORT __float128 strtof128(const char *__restrict str, char **__restrict end) {
 	if(end)
 		*end = const_cast<char *>(str);
-	__ensure(false);
+	return 0.0;
 }
 
 // todo implement in mlibc
@@ -253,11 +272,27 @@ EXPORT char *bind_textdomain_codeset(const char *domainname, const char *codeset
 	return const_cast<char *>("UTF-8");
 }
 
+// todo implement in mlibc
+EXPORT char *dcgettext(const char *domainname, const char *msgid, int category) {
+	return const_cast<char *>(msgid);
+}
+
+// todo implement in mlibc
+EXPORT char *dgettext(const char *domainname, const char *msgid) {
+	return const_cast<char *>(msgid);
+}
+
+extern "C" [[noreturn]] void __ensure_fail_wrap(const char *assertion, const char *file, unsigned int line,
+		const char *function) {
+	fprintf(stderr, "In function %s, file %s:%u\n__ensure(%s) failed\n", function, file, line, assertion);
+	quick_exit(1);
+}
+
 #undef iconv_open
 #undef iconv_close
 #undef iconv
 
-// todo implement in mlibc
+// todo implement in mlibc or figure out how to get it to find these in libiconv
 EXPORT iconv_t iconv_open(const char *tocode, const char *fromcode) {
 	return reinterpret_cast<iconv_t>(1);
 }
@@ -267,8 +302,9 @@ EXPORT size_t iconv(iconv_t cd, char **__restrict inbuf, size_t *__restrict inby
 	(void)outbytesleft;
 
 	if(cd == (iconv_t)1) { // UTF-8 to UTF-8
-		memcpy(inbuf, outbuf, sizeof(inbuf));
-		return sizeof(outbuf);
+		memcpy(inbuf, outbuf, *inbytesleft);
+		*outbytesleft = *inbytesleft;
+		return *outbytesleft;
 	}
 	__ensure(!"iconv() not implemented");
 	__builtin_unreachable();
@@ -278,62 +314,58 @@ EXPORT int iconv_close(iconv_t) {
 	return 0;
 }
 
-// todo implement in mlibc
-EXPORT char *dcgettext(const char *domainname, const char *msgid) {
-	return const_cast<char *>(msgid);
-}
-
-static auto fmodl_real = reinterpret_cast<long double (*)(long double, long double)>(
-	dlsym(RTLD_NEXT, "fmodl")
-);
-
-EXPORT long double fmodl(long double x, long double y) {
-	// todo figure out why this is needed
-	if(isnan(x))
-		return 0.0;
-	return fmodl_real(x, y);
-}
-
-extern "C" [[noreturn]] void __ensure_fail_wrap(const char *assertion, const char *file, unsigned int line,
-		const char *function) {
-	fprintf(stderr, "In function %s, file %s:%u\n__ensure(%s) failed\n", function, file, line, assertion);
-	quick_exit(1);
-}
+#if !WRAP_SYSCALL
+#include <sys/syscall.h>
+#endif
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
-EXPORT long sysconf(int name) {
-	switch(name) {
-	// _SC_NGROUPS_MAX
-	case 3:
-		return 65536;
-	// _SC_TZNAME_MAX
-	case 6:
-		return 6;
-	// _SC_MEMLOCK
-	case 17:
-		return 200809L;
-	// _SC_PAGE_SIZE
-	case 30:
-		return 0x1000;
-	// _SC_PHYS_PAGES
-	case 85: {
-		return 262144;
-	}
-	default:
-		fprintf(stderr, "sysconf unimplemented: %d\n", name);
-		return 0;
-	}
-}
-
-#include <sys/syscall.h>
-
 EXPORT ssize_t sendfile(int out, int in, off_t *offset, size_t count) {
-#if MANAGARM
-	return count;
+#if WRAP_SYSCALL
+	char buffer[512];
+	ssize_t res = 0;
+
+	off_t cur = 0;
+	if(offset) {
+		cur = lseek(in, *offset, SEEK_SET);
+	}
+
+	while(count) {
+		size_t to_copy = min(count, 512);
+		auto read_res = read(in, buffer, to_copy);
+		if(read_res < 0) {
+			if(offset) {
+				lseek(in, cur, SEEK_SET);
+			}
+			return read_res;
+		}
+		auto write_res = write(out, buffer, static_cast<size_t>(read_res));
+		if(write_res < 0) {
+			if(offset) {
+				lseek(in, cur, SEEK_SET);
+			}
+			return write_res;
+		}
+
+		res += write_res;
+		count -= static_cast<size_t>(write_res);
+		if(static_cast<size_t>(write_res) != to_copy) {
+			break;
+		}
+	}
+
+	if(offset) {
+		lseek(in, cur, SEEK_SET);
+	}
+
+	return res;
 #else
 	return syscall(SYS_sendfile, out, in, offset, count);
 #endif
 }
 
-EXPORT char __libc_single_threaded = 0;
+EXPORT size_t __mbrlen(const char *__restrict str, size_t n, mbstate_t *__restrict ps) {
+	return mbrlen(str, n, ps);
+}
+
+char __libc_single_threaded = 0;

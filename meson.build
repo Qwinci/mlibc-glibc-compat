@@ -2,8 +2,13 @@ project('mlibc-glibc-compat', 'cpp',
 	default_options : ['warning_level=2', 'cpp_std=c++20', 'b_lundef=false']
 )
 
+frigg_dep = dependency(
+	'frigg',
+	default_options: ['frigg_no_install=true'],
+	fallback: ['frigg', 'frigg_dep']
+)
+
 add_project_arguments('-Wno-unused-function', '-Wno-unused-parameter', language: ['cpp'])
-add_project_arguments('-nostdinc++', language: ['cpp'])
 add_project_arguments('-fno-rtti', '-fno-exceptions', language: ['cpp'])
 add_project_link_arguments('-nostdlib++', language: ['cpp'])
 
@@ -14,17 +19,42 @@ sources = files(
 	'src/misc.cpp',
 	'src/thread.cpp',
 	'src/ctype.cpp',
-	'src/mlibc_thread.cpp'
+	'src/mlibc_thread.cpp',
+	'src/caller.cpp'
 )
 
 if get_option('linux_kernel_headers') == ''
 	error('linux_kernel_headers is not set')
 endif
 
-include_dirs = include_directories(get_option('linux_kernel_headers'))
+include_dirs = include_directories(
+	get_option('linux_kernel_headers'),
+	'sysdeps'
+)
+
+conf = configuration_data()
+
+wrap_syscall = true
+
+if host_machine.system() == 'linux'
+	wrap_syscall = false
+	subdir('sysdeps/linux')
+elif host_machine.system() == 'managarm'
+	subdir('sysdeps/managarm')
+else
+	error('No sysdeps defined for OS: ' + host_machine.system())
+endif
+
+conf.set10('WRAP_SYSCALL', wrap_syscall)
+
+configure_file(input : 'config.h.in',
+	output : 'config.h',
+	configuration : conf
+)
 
 library = shared_library('mlibc_glibc_compat', sources,
 	include_directories: include_dirs,
+	dependencies: frigg_dep,
 	install : true
 )
 

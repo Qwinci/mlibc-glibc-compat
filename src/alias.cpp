@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <resolv.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include "utils.hpp"
 
 EXPORT int __isoc99_fscanf(FILE *__restrict file, const char *__restrict format, ...) {
@@ -64,6 +65,10 @@ EXPORT unsigned long long __isoc99_strtoull(const char *__restrict str, char **_
 	return strtoull(str, end, base);
 }
 
+EXPORT uintmax_t __isoc23_strtoumax(const char *__restrict str, char **__restrict end, int base) {
+	return strtoumax(str, end, base);
+}
+
 EXPORT long __isoc99_wcstol(const wchar_t *__restrict ptr, wchar_t **__restrict end, int base) {
 	return wcstol(ptr, end, base);
 }
@@ -91,9 +96,7 @@ EXPORT char *__nl_langinfo_l(nl_item item, locale_t locale) {
 }
 
 EXPORT wctype_t __wctype_l(const char *name, locale_t locale) {
-	// todo this has wrong signature in mlibc
-	//return wctype_l(name);
-	return wctype(name);
+	return wctype_l(name, locale);
 }
 
 EXPORT wint_t __towupper_l(wint_t value, locale_t locale) {
@@ -105,9 +108,7 @@ EXPORT wint_t __towlower_l(wint_t value, locale_t locale) {
 }
 
 EXPORT wint_t __iswctype_l(wint_t value, wctype_t desc, locale_t locale) {
-	// todo this has wrong signature in mlibc
-	//return iswctype_l(value, desc);
-	return iswctype(value, desc);
+	return iswctype_l(value, desc, locale);
 }
 
 EXPORT float __strtof_l(const char *__restrict str, char **__restrict end, locale_t locale) {
@@ -186,6 +187,7 @@ EXPORT char *__strdup(const char *str) {
 }
 
 asm(R"(
+.pushsection .text
 .globl open64
 .globl __open_2
 .globl __open64_2
@@ -205,6 +207,7 @@ openat64:
 __openat_2:
 __openat64_2:
 	jmp openat
+.popsection
 )");
 
 long __timezone;

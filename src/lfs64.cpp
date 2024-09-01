@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include "utils.hpp"
 
+#undef stat64
+
 EXPORT FILE *fopen64(const char *__restrict file, const char *__restrict mode) {
 	return fopen(file, mode);
 }
@@ -56,10 +58,6 @@ EXPORT int lstat64(const char *__restrict filename, struct stat *__restrict s) {
 	return lstat(filename, s);
 }
 
-EXPORT struct dirent *readdir64(DIR *dir) {
-	return readdir(dir);
-}
-
 EXPORT int setrlimit64(int resource, const struct rlimit *rlim) {
 	return setrlimit(resource, rlim);
 }
@@ -80,20 +78,12 @@ EXPORT int statfs64(const char *__restrict path, struct statfs *s) {
 	return statfs(path, s);
 }
 
-EXPORT int fstatfs64(int fd, struct statfs *s) {
-	return fstatfs(fd, s);
-}
-
 EXPORT int mkostemp64(char *path, int flags) {
 	return mkostemp(path, flags);
 }
 
 EXPORT int fstatat64(int fd, const char* __restrict path, struct stat *__restrict s, int flags) {
 	return fstatat(fd, path, s, flags);
-}
-
-EXPORT int fstatvfs64(int fd, struct statvfs *s) {
-	return fstatvfs(fd, s);
 }
 
 EXPORT ssize_t pread64(int fd, void *buf, size_t n, off64_t off) {

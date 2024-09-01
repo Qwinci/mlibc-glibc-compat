@@ -5,59 +5,11 @@
 #include <time.h>
 #include <string.h>
 #include <limits.h>
-#include <sys/syscall.h>
-#include <linux/futex.h>
 #include <unistd.h>
-#include "utils.hpp"
-
-#if __has_include(<hel.h>)
-#define MANAGARM 1
-#endif
-
-#if MANAGARM
-#include <hel.h>
-#include <hel-syscalls.h>
-#endif
 #include <fcntl.h>
-
-struct Guard {
-	Guard() {
-#if MANAGARM
-		int fd = open("/dev/helout", O_WRONLY);
-		dup2(fd, STDOUT_FILENO);
-		dup2(fd, STDERR_FILENO);
-#endif
-	}
-} guard {};
-
-pid_t sys_gettid() {
-	return gettid();
-}
-
-int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
-#if MANAGARM
-	if(time) {
-		if(helFutexWait(pointer, expected, time->tv_nsec + time->tv_sec * 1000000000))
-			return -1;
-		return 0;
-	}
-	if(helFutexWait(pointer, expected, -1))
-		return -1;
-	return 0;
-#else
-	return syscall(SYS_futex, pointer, FUTEX_WAIT, expected, time) < 0 ? errno : 0;
-#endif
-}
-
-int sys_futex_wake(int *pointer) {
-#if MANAGARM
-	if(helFutexWake(pointer))
-		return -1;
-	return 0;
-#else
-	return syscall(SYS_futex, pointer, FUTEX_WAKE, INT_MAX) < 0 ? errno : 0;
-#endif
-}
+#include "utils.hpp"
+#include "caller.hpp"
+#include "sysdeps.hpp"
 
 struct Mutex {
 	unsigned int __mlibc_state;
@@ -97,6 +49,7 @@ static_assert(sizeof(Condattr) <= 4);
 
 static constexpr unsigned int mutex_owner_mask = (static_cast<uint32_t>(1) << 30) - 1;
 static constexpr unsigned int mutex_waiters_bit = static_cast<uint32_t>(1) << 31;
+static constexpr unsigned int mutex_is_glibc = 1 << 0;
 
 EXPORT int __pthread_mutex_init(Mutex *__restrict mutex,
 		const Mutexattr *__restrict attr) {
@@ -110,23 +63,13 @@ EXPORT int __pthread_mutex_init(Mutex *__restrict mutex,
 	mutex->__mlibc_flags = 0;
 	mutex->__mlibc_prioceiling = 0; // TODO: We don't implement this.
 
-#if MANAGARM
-	if(__builtin_return_address(0) >= (void *)0x40000000) {
-		mutex->__mlibc_flags = type << 1;
+	auto addr = __builtin_extract_return_addr(__builtin_return_address(0));
+	if(mlibc_glibc_compat::is_glibc_caller(addr)) {
+		mutex->__mlibc_flags |= mutex_is_glibc;
+		mutex->__mlibc_kind = type;
 	} else {
-#endif
-		mutex->__mlibc_flags |= 1;
-		if(type == MLIBC_PTHREAD_MUTEX_RECURSIVE_NP) {
-			mutex->__mlibc_kind = MLIBC_PTHREAD_MUTEX_RECURSIVE_NP;
-		}else if(type == MLIBC_PTHREAD_MUTEX_ERRORCHECK_NP) {
-			mutex->__mlibc_kind = MLIBC_PTHREAD_MUTEX_ERRORCHECK_NP;
-		}else{
-			__ensure(type == MLIBC_PTHREAD_MUTEX_TIMED_NP);
-			mutex->__mlibc_kind = 0;
-		}
-#if MANAGARM
+		mutex->__mlibc_flags = type << 1;
 	}
-#endif
 
 	// TODO: Other values aren't supported yet.
 	__ensure(robust == 0);
@@ -144,7 +87,7 @@ EXPORT int __pthread_mutex_destroy(Mutex *mutex) {
 EXPORT_ALIAS("__pthread_mutex_destroy") int pthread_mutex_destroy(pthread_mutex_t *mutex);
 
 EXPORT int __pthread_mutex_lock_internal(Mutex *mutex, bool mlibc) {
-	unsigned int this_tid = sys_gettid();
+	unsigned int this_tid = gettid();
 	unsigned int expected = 0;
 	while(true) {
 		if(!expected) {
@@ -183,7 +126,7 @@ EXPORT int __pthread_mutex_lock_internal(Mutex *mutex, bool mlibc) {
 
 			// Wait on the futex if the waiters flag is set.
 			if(expected & mutex_waiters_bit) {
-				int e = sys_futex_wait((int *)&mutex->__mlibc_state, expected, nullptr);
+				int e = mlibc_glibc_compat::sys_futex_wait((int *)&mutex->__mlibc_state, expected, nullptr);
 
 				// If the wait returns EAGAIN, that means that the mutex_waiters_bit was just unset by
 				// some other thread. In this case, we should loop back around.
@@ -205,23 +148,17 @@ EXPORT int __pthread_mutex_lock_internal(Mutex *mutex, bool mlibc) {
 }
 
 EXPORT int __pthread_mutex_lock(Mutex *mutex) {
-#if MANAGARM
-	bool mlibc = __builtin_return_address(0) >= (void *)0x40000000;
-#else
-	bool mlibc = false;
-#endif
+	auto addr = __builtin_extract_return_addr(__builtin_return_address(0));
+	bool mlibc = !mlibc_glibc_compat::is_glibc_caller(addr);
 	return __pthread_mutex_lock_internal(mutex, mlibc);
 }
 EXPORT_ALIAS("__pthread_mutex_lock") int pthread_mutex_lock(pthread_mutex_t *mutex);
 
 EXPORT int __pthread_mutex_trylock(Mutex *mutex) {
-#if MANAGARM
-	bool mlibc = __builtin_return_address(0) >= (void *)0x40000000;
-#else
-	bool mlibc = false;
-#endif
+	auto addr = __builtin_extract_return_addr(__builtin_return_address(0));
+	bool mlibc = !mlibc_glibc_compat::is_glibc_caller(addr);
 
-	unsigned int this_tid = sys_gettid();
+	unsigned int this_tid = gettid();
 	unsigned int expected = __atomic_load_n(&mutex->__mlibc_state, __ATOMIC_RELAXED);
 	if(!expected) {
 		// Try to take the mutex here.
@@ -271,7 +208,7 @@ EXPORT int __pthread_mutex_unlock_internal(Mutex *mutex, bool mlibc) {
 	// After this point the mutex is unlocked, and therefore we cannot access its contents as it
 	// may have been destroyed by another thread.
 
-	unsigned int this_tid = sys_gettid();
+	unsigned int this_tid = gettid();
 	if(mlibc) {
 		if ((mutex->__mlibc_flags >> 1) == MLIBC_PTHREAD_MUTEX_ERRORCHECK_NP && (state & mutex_owner_mask) != this_tid)
 			return EPERM;
@@ -291,7 +228,7 @@ EXPORT int __pthread_mutex_unlock_internal(Mutex *mutex, bool mlibc) {
 	if(state & mutex_waiters_bit) {
 		// Wake the futex if there were waiters. Since the mutex might not exist at this location
 		// anymore, we must conservatively ignore EACCES and EINVAL which may occur as a result.
-		int e = sys_futex_wake((int *)&mutex->__mlibc_state);
+		int e = mlibc_glibc_compat::sys_futex_wake((int *)&mutex->__mlibc_state);
 		__ensure(e >= 0 || e == EACCES || e == EINVAL);
 	}
 
@@ -299,11 +236,8 @@ EXPORT int __pthread_mutex_unlock_internal(Mutex *mutex, bool mlibc) {
 }
 
 EXPORT int __pthread_mutex_unlock(Mutex *mutex) {
-#if MANAGARM
-	bool mlibc = __builtin_return_address(0) >= (void *)0x40000000;
-#else
-	bool mlibc = false;
-#endif
+	auto addr = __builtin_extract_return_addr(__builtin_return_address(0));
+	bool mlibc = !mlibc_glibc_compat::is_glibc_caller(addr);
 	return __pthread_mutex_unlock_internal(mutex, mlibc);
 }
 EXPORT_ALIAS("__pthread_mutex_unlock") int pthread_mutex_unlock(pthread_mutex_t *mutex);
@@ -336,15 +270,14 @@ EXPORT int __pthread_mutexattr_gettype(const Mutexattr *__restrict attr, int *__
 EXPORT_ALIAS("__pthread_mutexattr_gettype") int pthread_mutexattr_gettype(const pthread_mutexattr_t *__restrict attr, int *__restrict type);
 
 EXPORT int __pthread_mutexattr_settype(Mutexattr *attr, int type) {
-#if MANAGARM
-	if(__builtin_return_address(0) >= (void *)0x40000000) {
+	auto addr = __builtin_extract_return_addr(__builtin_return_address(0));
+	if(!mlibc_glibc_compat::is_glibc_caller(addr)) {
 		if(type == 1) {
 			type = MLIBC_PTHREAD_MUTEX_ERRORCHECK_NP;
 		} else if(type == 2) {
 			type = MLIBC_PTHREAD_MUTEX_RECURSIVE_NP;
 		}
 	}
-#endif
 
 	if (type != MLIBC_PTHREAD_MUTEX_TIMED_NP && type != MLIBC_PTHREAD_MUTEX_ERRORCHECK_NP
 			&& type != MLIBC_PTHREAD_MUTEX_RECURSIVE_NP)
@@ -438,7 +371,7 @@ EXPORT_ALIAS("__pthread_cond_destroy") int pthread_cond_destroy(pthread_cond_t *
 
 EXPORT int __pthread_cond_broadcast(Cond *cond) {
 	__atomic_fetch_add(&cond->__mlibc_seq, 1, __ATOMIC_RELEASE);
-	if(int e = sys_futex_wake((int *)&cond->__mlibc_seq); e) {
+	if(int e = mlibc_glibc_compat::sys_futex_wake((int *)&cond->__mlibc_seq); e) {
 		fprintf(stderr, "sys_futex_wake() failed with error code %d\n", e);
 		__ensure(false);
 	}
@@ -491,9 +424,9 @@ EXPORT int __pthread_cond_timedwait_internal(Cond *__restrict cond, Mutex *__res
 				__ensure(timeout.tv_nsec >= 0);
 			}
 
-			e = sys_futex_wait((int *)&cond->__mlibc_seq, seq, &timeout);
+			e = mlibc_glibc_compat::sys_futex_wait((int *)&cond->__mlibc_seq, seq, &timeout);
 		} else {
-			e = sys_futex_wait((int *)&cond->__mlibc_seq, seq, nullptr);
+			e = mlibc_glibc_compat::sys_futex_wait((int *)&cond->__mlibc_seq, seq, nullptr);
 		}
 
 		if (__pthread_mutex_lock_internal(mutex, mlibc))
@@ -529,21 +462,15 @@ EXPORT int __pthread_cond_timedwait_internal(Cond *__restrict cond, Mutex *__res
 
 EXPORT int __pthread_cond_timedwait(Cond *__restrict cond, Mutex *__restrict mutex,
 		const struct timespec *__restrict abstime) {
-#if MANAGARM
-	bool mlibc = __builtin_return_address(0) >= (void *)0x40000000;
-#else
-	bool mlibc = false;
-#endif
+	auto addr = __builtin_extract_return_addr(__builtin_return_address(0));
+	bool mlibc = !mlibc_glibc_compat::is_glibc_caller(addr);
 	return __pthread_cond_timedwait_internal(cond, mutex, abstime, mlibc);
 }
 EXPORT_ALIAS("__pthread_cond_timedwait") int pthread_cond_timedwait(pthread_cond_t *__restrict cond, pthread_mutex_t *__restrict mutex, const struct timespec *__restrict abstime);
 
 EXPORT int __pthread_cond_wait(Cond *__restrict cond, Mutex *__restrict mutex) {
-#if MANAGARM
-	bool mlibc = __builtin_return_address(0) >= (void *)0x40000000;
-#else
-	bool mlibc = false;
-#endif
+	auto addr = __builtin_extract_return_addr(__builtin_return_address(0));
+	bool mlibc = !mlibc_glibc_compat::is_glibc_caller(addr);
 	return __pthread_cond_timedwait_internal(cond, mutex, nullptr, mlibc);
 }
 EXPORT_ALIAS("__pthread_cond_wait") int pthread_cond_wait(pthread_cond_t *__restrict cond, pthread_mutex_t *__restrict mutex);

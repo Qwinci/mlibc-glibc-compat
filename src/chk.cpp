@@ -166,7 +166,9 @@ EXPORT size_t __strlcpy_chk(char *__restrict dest, const char *__restrict src, s
 }
 
 asm(R"(
+.pushsection .text
 .globl __longjmp_chk
 __longjmp_chk:
 	jmp longjmp
+.popsection
 )");
