@@ -1,1 +1,2 @@
 option('linux_kernel_headers', type: 'string', value : '')
+option('iconv_stubs', type: 'boolean', value : true)

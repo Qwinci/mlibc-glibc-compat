@@ -23,6 +23,10 @@ namespace {
 	frg::hash_map<void *, bool, frg::hash<void *>, Allocator> cache{frg::hash<void *> {}};
 }
 
+#ifndef ELFOSABI_SOLARIS
+#define ELFOSABI_SOLARIS 6
+#endif
+
 namespace mlibc_glibc_compat {
 
 bool is_glibc_caller(void* return_addr) {
@@ -36,6 +40,17 @@ bool is_glibc_caller(void* return_addr) {
 	if(res == 0) {
 		fprintf(stderr, "mlibc_glibc_compat: dladdr1 failed with %d, assuming non glibc caller\n", res);
 		return false;
+	}
+
+	// first look if the os abi field is set to Solaris (which it is set to by the mlibcify script)
+	auto *ehdr = static_cast<ElfW(Ehdr) *>(info.dli_fbase);
+	if(ehdr->e_ident[EI_OSABI] == ELFOSABI_SOLARIS) {
+		if constexpr(logCaller) {
+			printf("mlibc_glibc_compat: caller for %p determined to be glibc from os abi\n", return_addr);
+		}
+
+		cache.insert(return_addr, true);
+		return true;
 	}
 
 	size_t ver_need_count = 0;

@@ -1,6 +1,9 @@
 #include "sysdeps.hpp"
 #include <sys/syscall.h>
+#include <unistd.h>
 #include <linux/futex.h>
+#include <errno.h>
+#include <limits.h>
 
 namespace mlibc_glibc_compat {
 
